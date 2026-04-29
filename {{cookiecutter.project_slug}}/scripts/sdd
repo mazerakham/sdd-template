@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# SDD Workflow Script
+# Enforces spec-driven development discipline
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+log_info() { echo -e "${BLUE}[SDD]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SDD]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[SDD]${NC} $1"; }
+log_error() { echo -e "${RED}[SDD]${NC} $1" >&2; }
+
+#######################################
+# VALIDATION
+#######################################
+
+validate_in_repo() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not in a git repository"
+        exit 1
+    fi
+}
+
+validate_clean() {
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        log_error "Working directory not clean. Commit or stash changes first."
+        exit 1
+    fi
+}
+
+get_current_branch() {
+    git rev-parse --abbrev-ref HEAD
+}
+
+get_agent_role() {
+    local branch=$(get_current_branch)
+    local worktree_path=$(pwd)
+
+    if [[ "$branch" == "main" ]]; then
+        echo "spec"
+    elif [[ "$branch" == plan-v* ]]; then
+        echo "plan"
+    elif [[ "$worktree_path" == *impl-v* ]]; then
+        echo "impl"
+    else
+        echo "unknown"
+    fi
+}
+
+validate_role() {
+    local expected_role=$1
+    local actual_role=$(get_agent_role)
+
+    if [[ "$actual_role" != "$expected_role" ]]; then
+        log_error "This command requires $expected_role role, but you are: $actual_role"
+        log_error "Current branch: $(get_current_branch)"
+        exit 1
+    fi
+}
+
+validate_file_ownership() {
+    local role=$(get_agent_role)
+    local staged_files=$(git diff --cached --name-only 2>/dev/null || true)
+
+    if [[ -z "$staged_files" ]]; then
+        return 0
+    fi
+
+    local violations=""
+
+    while IFS= read -r file; do
+        case "$role" in
+            spec)
+                # Spec agent can only modify specs/, knowledge/, WORKFLOW.md, CLAUDE.md, scripts/
+                if [[ ! "$file" =~ ^(specs/|knowledge/|WORKFLOW\.md|CLAUDE\.md|SETUP\.md|scripts/) ]]; then
+                    violations+="  - $file (spec agent cannot modify)\n"
+                fi
+                ;;
+            plan)
+                # Plan agent can only modify plans/
+                if [[ ! "$file" =~ ^plans/ ]]; then
+                    violations+="  - $file (plan agent cannot modify)\n"
+                fi
+                ;;
+            impl)
+                # Impl agent can modify src/, lib/, AMBIGUITIES.md, SPEC_FEEDBACK.md, tests/
+                # Customize this pattern for your project structure
+                if [[ ! "$file" =~ ^(src/|lib/|AMBIGUITIES\.md|SPEC_FEEDBACK\.md|VERIFICATION_RESULTS\.md|tests/) ]]; then
+                    violations+="  - $file (impl agent cannot modify)\n"
+                fi
+                ;;
+            verify)
+                # Verify agent can only modify VERIFY_REPORT.md
+                if [[ ! "$file" =~ ^VERIFY_REPORT\.md$ ]]; then
+                    violations+="  - $file (verify agent cannot modify)\n"
+                fi
+                ;;
+        esac
+    done <<< "$staged_files"
+
+    if [[ -n "$violations" ]]; then
+        log_error "File ownership violations detected:"
+        echo -e "$violations"
+        exit 1
+    fi
+}
+
+#######################################
+# PREFLIGHT CHECK
+#######################################
+
+cmd_preflight() {
+    log_info "Running pre-flight checks..."
+    local errors=0
+
+    # 1. Check git repo
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        log_success "Git repo: OK"
+    else
+        log_error "Git repo: NOT INITIALIZED"
+        log_info "  Fix: git init"
+        ((errors++))
+    fi
+
+    # 2. Check required directories exist
+    for dir in specs plans knowledge; do
+        if [[ -d "$ROOT_DIR/$dir" ]]; then
+            log_success "Directory $dir/: OK"
+        else
+            log_warn "Directory $dir/: MISSING"
+            log_info "  Fix: mkdir -p $dir"
+        fi
+    done
+
+    # 3. Check CLAUDE.md exists
+    if [[ -f "$ROOT_DIR/CLAUDE.md" ]]; then
+        log_success "CLAUDE.md: OK"
+    else
+        log_error "CLAUDE.md: MISSING"
+        ((errors++))
+    fi
+
+    # Add your project-specific checks here:
+    # - Python version
+    # - Node version
+    # - Database connection
+    # - API credentials
+    # etc.
+
+    echo ""
+    if [[ $errors -eq 0 ]]; then
+        log_success "Pre-flight checks passed. Ready to work."
+    else
+        log_error "Pre-flight failed with $errors error(s). Fix before proceeding."
+        exit 1
+    fi
+}
+
+#######################################
+# SPEC COMMANDS
+#######################################
+
+cmd_spec_release() {
+    local version=${1:-}
+
+    if [[ -z "$version" ]]; then
+        log_error "Usage: sdd spec-release <version>"
+        log_error "Example: sdd spec-release v1.0"
+        exit 1
+    fi
+
+    validate_in_repo
+    validate_role "spec"
+
+    # Ensure we're on main
+    local branch=$(get_current_branch)
+    if [[ "$branch" != "main" ]]; then
+        log_error "spec-release must be run from main branch"
+        exit 1
+    fi
+
+    # Check for uncommitted changes
+    if ! git diff-index --quiet HEAD --; then
+        log_error "Uncommitted changes. Commit first, then release."
+        exit 1
+    fi
+
+    local tag="spec-$version"
+
+    if git rev-parse "$tag" >/dev/null 2>&1; then
+        log_error "Tag $tag already exists"
+        exit 1
+    fi
+
+    git tag -a "$tag" -m "Spec release $version"
+    log_success "Created tag: $tag"
+    log_info "Downstream agents can now create plans from this spec version"
+}
+
+#######################################
+# PLAN COMMANDS
+#######################################
+
+cmd_plan_create() {
+    local spec_version=${1:-}
+    local plan_number=${2:-}
+
+    if [[ -z "$spec_version" || -z "$plan_number" ]]; then
+        log_error "Usage: sdd plan-create <spec-version> <plan-number>"
+        log_error "Example: sdd plan-create v1.0 1"
+        exit 1
+    fi
+
+    validate_in_repo
+
+    local spec_tag="spec-$spec_version"
+    local plan_branch="plan-${spec_version}.${plan_number}"
+
+    # Verify spec tag exists
+    if ! git rev-parse "$spec_tag" >/dev/null 2>&1; then
+        log_error "Spec tag $spec_tag does not exist"
+        log_info "Available spec tags:"
+        git tag -l 'spec-*'
+        exit 1
+    fi
+
+    # Check if plan branch already exists
+    if git rev-parse "$plan_branch" >/dev/null 2>&1; then
+        log_error "Plan branch $plan_branch already exists"
+        exit 1
+    fi
+
+    # Create plan branch from spec tag
+    git checkout -b "$plan_branch" "$spec_tag"
+
+    # Create plans directory if needed
+    mkdir -p plans
+
+    log_success "Created plan branch: $plan_branch"
+    log_info "You are now on the plan branch. Create plans/*.plan.md"
+    log_info "Reference: Based on $spec_tag"
+}
+
+#######################################
+# IMPL COMMANDS
+#######################################
+
+cmd_impl_start() {
+    local plan_branch=${1:-}
+    local agent_name=${2:-}
+
+    if [[ -z "$plan_branch" || -z "$agent_name" ]]; then
+        log_error "Usage: sdd impl-start <plan-branch> <agent-name>"
+        log_error "Example: sdd impl-start plan-v1.0.1 alice"
+        exit 1
+    fi
+
+    validate_in_repo
+
+    # Verify plan branch exists
+    if ! git rev-parse "$plan_branch" >/dev/null 2>&1; then
+        log_error "Plan branch $plan_branch does not exist"
+        log_info "Available plan branches:"
+        git branch -l 'plan-*'
+        exit 1
+    fi
+
+    local impl_name="impl-${plan_branch#plan-}-${agent_name}"
+    local worktree_path=".worktrees/${impl_name}"
+
+    # Ensure .worktrees directory exists and is gitignored
+    mkdir -p ".worktrees"
+    if ! grep -q "^.worktrees/" .gitignore 2>/dev/null; then
+        echo ".worktrees/" >> .gitignore
+    fi
+
+    # Check if worktree already exists
+    if [[ -d "$worktree_path" ]]; then
+        log_error "Worktree $worktree_path already exists"
+        log_info "To resume: cd $worktree_path"
+        exit 1
+    fi
+
+    # Create worktree with new branch
+    git worktree add -b "$impl_name" "$worktree_path" "$plan_branch"
+
+    # Create AMBIGUITIES.md in worktree
+    cat > "${worktree_path}/AMBIGUITIES.md" << EOF
+# Implementation Ambiguities
+
+**Branch:** \`$impl_name\`
+**Base:** \`$plan_branch\`
+**Agent:** $agent_name
+**Date:** $(date +%Y-%m-%d)
+
+Ambiguities encountered during implementation. Each needs spec-writer review.
+
+---
+
+<!-- Add ambiguities below as you encounter them -->
+EOF
+
+    # Create SPEC_FEEDBACK.md template
+    cat > "${worktree_path}/SPEC_FEEDBACK.md" << EOF
+# Spec Feedback from Implementation
+
+**Branch:** \`$impl_name\`
+**Agent:** $agent_name
+**Date:** $(date +%Y-%m-%d)
+
+Issues encountered that could be prevented with spec/knowledge improvements.
+
+---
+
+## Schema/Data Gaps
+
+<!-- Wrong assumptions? Missing info? -->
+
+---
+
+## Environment Setup Gaps
+
+<!-- Dependencies? Permissions? Config? -->
+
+---
+
+## Spec Gaps
+
+<!-- Requirements unclear? Missing acceptance criteria? -->
+
+---
+
+## Classification
+
+| Issue | Category | Why |
+|-------|----------|-----|
+| | Spec gap / My mistake | |
+
+EOF
+
+    log_success "Created impl worktree: $worktree_path"
+    log_info "To start working: cd $worktree_path"
+    log_info "Run ./scripts/sdd preflight before starting"
+    log_info "Document ambiguities in AMBIGUITIES.md"
+}
+
+cmd_impl_submit() {
+    validate_in_repo
+    validate_role "impl"
+
+    local branch=$(get_current_branch)
+
+    # Check AMBIGUITIES.md exists
+    if [[ ! -f "AMBIGUITIES.md" ]]; then
+        log_error "AMBIGUITIES.md not found. Create it even if empty."
+        exit 1
+    fi
+
+    # Check SPEC_FEEDBACK.md exists
+    if [[ ! -f "SPEC_FEEDBACK.md" ]]; then
+        log_error "SPEC_FEEDBACK.md not found. Document what you learned."
+        exit 1
+    fi
+
+    log_info "Impl branch ready for review: $branch"
+    log_info "Reviewer should check:"
+    log_info "  1. All plan tasks completed"
+    log_info "  2. AMBIGUITIES.md reviewed"
+    log_info "  3. SPEC_FEEDBACK.md reviewed"
+    log_info "  4. Tests pass"
+}
+
+#######################################
+# VERIFY COMMANDS
+#######################################
+
+cmd_verify() {
+    validate_in_repo
+
+    log_info "Running verification..."
+
+    # Add your verification logic here
+    # Examples:
+    # - Run test suite
+    # - Run linters
+    # - Check code coverage
+    # - Validate against spec criteria
+
+    log_warn "Verification not yet configured."
+    log_info "Add your verification commands to scripts/sdd cmd_verify()"
+}
+
+cmd_verify_start() {
+    local impl_name=${1:-}
+
+    if [[ -z "$impl_name" ]]; then
+        log_error "Usage: sdd verify-start <impl-name>"
+        log_error "Example: sdd verify-start impl-v1.0.1-alice"
+        exit 1
+    fi
+
+    validate_in_repo
+
+    local worktree_path=".worktrees/$impl_name"
+
+    if [[ ! -d "$worktree_path" ]]; then
+        log_error "Worktree $worktree_path not found"
+        log_info "Available implementations:"
+        git worktree list | grep impl-
+        exit 1
+    fi
+
+    log_info "Starting verification of $impl_name"
+    log_info ""
+    log_info "Verify Agent Checklist:"
+    log_info "  1. cd $worktree_path"
+    log_info "  2. Run: ./scripts/sdd verify"
+    log_info "  3. Sample records, trace end-to-end"
+    log_info "  4. Write findings to VERIFY_REPORT.md"
+    log_info "  5. Run: ./scripts/sdd verify-approve $impl_name"
+    log_info "     or:  ./scripts/sdd verify-reject $impl_name \"reason\""
+
+    # Create VERIFY_REPORT.md template if it doesn't exist
+    local report_file="${worktree_path}/VERIFY_REPORT.md"
+    if [[ ! -f "$report_file" ]]; then
+        cat > "$report_file" << EOF
+# Verification Report
+
+**Implementation:** \`$impl_name\`
+**Verifier:** [Your name]
+**Date:** $(date +%Y-%m-%d)
+**Status:** IN PROGRESS
+
+---
+
+## Automated Checks
+
+\`\`\`
+[Run ./scripts/sdd verify and paste results here]
+\`\`\`
+
+---
+
+## Sample Record Verification
+
+### Sample 1
+- **ID:**
+- **Expected:**
+- **Actual:**
+- **Status:** PASS / FAIL
+- **Notes:**
+
+### Sample 2
+[...]
+
+---
+
+## Findings
+
+### Issues Found
+- [ ]
+
+### Recommendations
+- [ ]
+
+---
+
+## Verdict
+
+- [ ] **APPROVED** - Ready for merge
+- [ ] **REJECTED** - Issues must be fixed
+
+**Reason:**
+
+EOF
+        log_success "Created VERIFY_REPORT.md template"
+    fi
+}
+
+cmd_verify_approve() {
+    local impl_name=${1:-}
+
+    if [[ -z "$impl_name" ]]; then
+        log_error "Usage: sdd verify-approve <impl-name>"
+        exit 1
+    fi
+
+    validate_in_repo
+
+    local worktree_path=".worktrees/$impl_name"
+    local report_file="${worktree_path}/VERIFY_REPORT.md"
+
+    if [[ ! -f "$report_file" ]]; then
+        log_error "VERIFY_REPORT.md not found. Run verify-start first."
+        exit 1
+    fi
+
+    # Update status in report
+    sed -i '' 's/Status:\*\* IN PROGRESS/Status:** APPROVED/' "$report_file" 2>/dev/null || \
+    sed -i 's/Status:\*\* IN PROGRESS/Status:** APPROVED/' "$report_file"
+
+    echo "" >> "$report_file"
+    echo "---" >> "$report_file"
+    echo "**Approved:** $(date)" >> "$report_file"
+
+    log_success "Implementation $impl_name APPROVED"
+    log_info "Ready for human review and merge"
+}
+
+cmd_verify_reject() {
+    local impl_name=${1:-}
+    local reason=${2:-"No reason provided"}
+
+    if [[ -z "$impl_name" ]]; then
+        log_error "Usage: sdd verify-reject <impl-name> \"reason\""
+        exit 1
+    fi
+
+    validate_in_repo
+
+    local worktree_path=".worktrees/$impl_name"
+    local report_file="${worktree_path}/VERIFY_REPORT.md"
+
+    if [[ ! -f "$report_file" ]]; then
+        log_error "VERIFY_REPORT.md not found. Run verify-start first."
+        exit 1
+    fi
+
+    # Update status in report
+    sed -i '' 's/Status:\*\* IN PROGRESS/Status:** REJECTED/' "$report_file" 2>/dev/null || \
+    sed -i 's/Status:\*\* IN PROGRESS/Status:** REJECTED/' "$report_file"
+
+    echo "" >> "$report_file"
+    echo "---" >> "$report_file"
+    echo "**Rejected:** $(date)" >> "$report_file"
+    echo "**Reason:** $reason" >> "$report_file"
+
+    log_error "Implementation $impl_name REJECTED"
+    log_info "Reason: $reason"
+    log_info "Impl agent should address issues and resubmit"
+}
+
+#######################################
+# VALIDATE COMMAND
+#######################################
+
+cmd_validate() {
+    validate_in_repo
+
+    local role=$(get_agent_role)
+    local errors=0
+
+    log_info "Validating SDD discipline..."
+    log_info "Detected role: $role"
+
+    # Check file ownership
+    validate_file_ownership || ((errors++))
+
+    # Role-specific checks
+    case "$role" in
+        spec)
+            # Check knowledge files have sources
+            if [[ -d "knowledge" ]]; then
+                for f in knowledge/*.md; do
+                    if [[ -f "$f" && "$f" != *"GUIDE"* && "$f" != *"README"* ]]; then
+                        if ! grep -q "Source:" "$f" && ! grep -q "source:" "$f" && ! grep -q "Validated:" "$f"; then
+                            log_warn "$f may be missing source citations or validation"
+                        fi
+                    fi
+                done
+            fi
+            ;;
+        plan)
+            # Check plan references spec version
+            if [[ -d "plans" ]]; then
+                for f in plans/*.plan.md; do
+                    if [[ -f "$f" ]]; then
+                        if ! grep -q "spec-v" "$f"; then
+                            log_warn "$f should reference a spec version"
+                        fi
+                    fi
+                done
+            fi
+            ;;
+        impl)
+            # Check AMBIGUITIES.md exists
+            if [[ ! -f "AMBIGUITIES.md" ]]; then
+                log_error "AMBIGUITIES.md not found"
+                ((errors++))
+            fi
+            ;;
+    esac
+
+    if [[ $errors -eq 0 ]]; then
+        log_success "Validation passed"
+    else
+        log_error "Validation failed with $errors error(s)"
+        exit 1
+    fi
+}
+
+#######################################
+# LATEST-SPEC COMMAND
+#######################################
+
+cmd_latest_spec() {
+    validate_in_repo
+
+    local latest=$(git tag -l 'spec-*' --sort=-version:refname | head -1)
+
+    if [[ -z "$latest" ]]; then
+        log_warn "No spec versions found"
+        log_info "Create one with: ./scripts/sdd spec-release v1.0"
+        exit 1
+    fi
+
+    echo "$latest"
+}
+
+#######################################
+# STATUS COMMAND
+#######################################
+
+cmd_status() {
+    validate_in_repo
+
+    echo ""
+    log_info "SDD Project Status"
+    echo "===================="
+    echo ""
+
+    # Show spec versions
+    echo "Spec Versions:"
+    git tag -l 'spec-*' | while read tag; do
+        echo "  $tag"
+    done
+    echo ""
+
+    # Show plan branches
+    echo "Plan Branches:"
+    git branch -l 'plan-*' 2>/dev/null | while read branch; do
+        echo "  $branch"
+    done
+    echo ""
+
+    # Show worktrees
+    echo "Implementation Worktrees:"
+    git worktree list | grep -v "^$(git rev-parse --show-toplevel)" | while read line; do
+        echo "  $line"
+    done
+    echo ""
+}
+
+#######################################
+# HELP
+#######################################
+
+cmd_help() {
+    cat << EOF
+SDD Workflow Commands
+
+ENVIRONMENT:
+  sdd preflight                  Check environment is ready
+  sdd validate                   Check SDD discipline
+
+SPEC AGENT (on main branch):
+  sdd spec-release <version>     Create spec version tag
+  sdd latest-spec                Show latest spec version
+
+PLAN AGENT:
+  sdd plan-create <spec> <num>   Create plan branch from spec
+
+IMPL AGENT:
+  sdd impl-start <plan> <name>   Create impl worktree
+  sdd impl-submit                Mark impl ready for review
+
+VERIFY AGENT:
+  sdd verify                     Run verification
+  sdd verify-start <impl>        Start verification of impl
+  sdd verify-approve <impl>      Approve implementation
+  sdd verify-reject <impl> "msg" Reject with reason
+
+STATUS:
+  sdd status                     Show project status
+
+EOF
+}
+
+#######################################
+# MAIN
+#######################################
+
+main() {
+    local cmd=${1:-help}
+    shift || true
+
+    case "$cmd" in
+        preflight) cmd_preflight "$@" ;;
+        spec-release) cmd_spec_release "$@" ;;
+        latest-spec) cmd_latest_spec "$@" ;;
+        plan-create) cmd_plan_create "$@" ;;
+        impl-start) cmd_impl_start "$@" ;;
+        impl-submit) cmd_impl_submit "$@" ;;
+        verify) cmd_verify "$@" ;;
+        verify-start) cmd_verify_start "$@" ;;
+        verify-approve) cmd_verify_approve "$@" ;;
+        verify-reject) cmd_verify_reject "$@" ;;
+        validate) cmd_validate "$@" ;;
+        status) cmd_status "$@" ;;
+        help|--help|-h) cmd_help ;;
+        *) log_error "Unknown command: $cmd"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

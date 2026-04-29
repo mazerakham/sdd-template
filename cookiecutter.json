@@ -1,0 +1,10 @@
+{
+  "project_name": "My SDD Project",
+  "project_slug": "{{ cookiecutter.project_name.lower().replace(' ', '-').replace('_', '-') }}",
+  "description": "A spec-driven development project",
+  "author": "Your Name",
+  "python_version": "3.12",
+  "_copy_without_render": [
+    "scripts/*"
+  ]
+}
