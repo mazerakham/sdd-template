@@ -20,9 +20,12 @@ def main():
         capture_output=True
     )
 
-    print("""
+    # Get project name from the current directory (cookiecutter already rendered it)
+    project_name = os.path.basename(os.getcwd())
+
+    print(f"""
 ================================================================================
-  {{ cookiecutter.project_name }} created successfully!
+  {project_name} created successfully!
 ================================================================================
 
 Next steps:

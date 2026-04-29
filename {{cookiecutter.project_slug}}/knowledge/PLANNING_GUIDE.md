@@ -112,6 +112,16 @@ Example:
 | No duplicate keys | COUNT(DISTINCT id) = COUNT(*) | 0 duplicates |
 | Valid FKs | All customer_id values exist in customers | 0 orphans |
 
+### Test Count Guidelines
+
+| Complexity | Expected Tests |
+|------------|----------------|
+| Simple feature | 10-15 tests |
+| Medium feature | 20-30 tests |
+| Complex feature | 30+ tests |
+
+If your plan has fewer than 10 tests, you're probably missing something.
+
 ### Testing Boundary
 
 | Agent | Tests For |

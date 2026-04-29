@@ -146,3 +146,4 @@ Task 2 ─────┘
 - [ ] Testing section complete with specific tests
 - [ ] Each spec scenario has a corresponding test
 - [ ] Edge cases documented with tests
+- [ ] At least 10 tests specified (more for complex features)

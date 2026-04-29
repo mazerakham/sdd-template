@@ -163,9 +163,18 @@ Submit with: `./scripts/sdd impl-submit`
 3. Run verification queries from spec
 4. Document findings in VERIFY_REPORT.md
 
+**What to look for (beyond automated tests):**
+- Integration issues between components
+- Race conditions or timing issues
+- Error handling paths not covered
+- Real-world data edge cases
+- Performance under load
+
 **Verdict:**
 - APPROVE if all criteria met
 - REJECT with specific reasons if not
+
+**If you find basic failures** (duplicates, nulls, broken FKs, balance equations), note in VERIFY_REPORT.md that the plan should have specified these tests.
 
 Commands:
 ```bash
