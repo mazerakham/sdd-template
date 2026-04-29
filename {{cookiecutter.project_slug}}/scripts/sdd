@@ -609,6 +609,24 @@ cmd_validate() {
 }
 
 #######################################
+# LATEST-SPEC COMMAND
+#######################################
+
+cmd_latest_spec() {
+    validate_in_repo
+
+    local latest=$(git tag -l 'spec-*' --sort=-version:refname | head -1)
+
+    if [[ -z "$latest" ]]; then
+        log_warn "No spec versions found"
+        log_info "Create one with: ./scripts/sdd spec-release v1.0"
+        exit 1
+    fi
+
+    echo "$latest"
+}
+
+#######################################
 # STATUS COMMAND
 #######################################
 
@@ -656,6 +674,7 @@ ENVIRONMENT:
 
 SPEC AGENT (on main branch):
   sdd spec-release <version>     Create spec version tag
+  sdd latest-spec                Show latest spec version
 
 PLAN AGENT:
   sdd plan-create <spec> <num>   Create plan branch from spec
@@ -687,6 +706,7 @@ main() {
     case "$cmd" in
         preflight) cmd_preflight "$@" ;;
         spec-release) cmd_spec_release "$@" ;;
+        latest-spec) cmd_latest_spec "$@" ;;
         plan-create) cmd_plan_create "$@" ;;
         impl-start) cmd_impl_start "$@" ;;
         impl-submit) cmd_impl_submit "$@" ;;
